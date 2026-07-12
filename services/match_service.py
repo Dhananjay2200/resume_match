@@ -1,133 +1,98 @@
 
 
-import os
 import json
 import time
+import difflib
 import pdfplumber
-import requests
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-HF_TOKEN = os.getenv("HF_TOKEN")
-if not HF_TOKEN:
-    raise RuntimeError(
-        "HF_TOKEN environment variable is not set. "
-        "Add it as a secret in your HF Space settings."
+MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
+
+# Auto-detect: use GPU if one is actually present, otherwise fall back to CPU.
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
+
+print(f"[INFO] Loading {MODEL_NAME} | device={DEVICE} | dtype={DTYPE}")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=DTYPE).to(DEVICE)
+print("[INFO] Model loaded.")
+
+if DEVICE == "cpu":
+    print(
+        "[WARN] Running on CPU -- generation will be noticeably slower than "
+        "on GPU. This is expected on a machine without a CUDA GPU."
     )
 
-API_URL = "https://router.huggingface.co/v1/chat/completions"
-
-MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct:featherless-ai"
-
-HEADERS = {
-    "Authorization": f"Bearer {HF_TOKEN}",
-    "Content-Type": "application/json",
-}
-
-# Minimum characters of extracted PDF text before we consider it "readable".
 MIN_RESUME_TEXT_LENGTH = 30
-
-# Empty skeleton returned whenever extraction/parsing fails, so downstream
-.
 EMPTY_EXTRACTION = {"skills": [], "experience": [], "education": []}
 
-# Common aliases -> standard skill name. Lookup is case-insensitive and
-
 SKILL_ALIASES = {
-    "fast api": "FastAPI",
-    "fastapi": "FastAPI",
-    "py torch": "PyTorch",
-    "pytorch": "PyTorch",
-    "ml": "Machine Learning",
-    "machine learning": "Machine Learning",
-    "dl": "Deep Learning",
-    "deep learning": "Deep Learning",
-    "llms": "LLM",
-    "llm": "LLM",
-    "large language model": "LLM",
-    "large language models": "LLM",
-    "cv": "Computer Vision",
-    "computer vision": "Computer Vision",
-    "nlp": "NLP",
-    "natural language processing": "NLP",
-    "react js": "React",
-    "reactjs": "React",
-    "react": "React",
-    "node js": "Node.js",
-    "nodejs": "Node.js",
-    "node.js": "Node.js",
-    "mongo db": "MongoDB",
-    "mongodb": "MongoDB",
-    "tensor flow": "TensorFlow",
-    "tensorflow": "TensorFlow",
-    "postgre sql": "PostgreSQL",
-    "postgresql": "PostgreSQL",
+    "fast api": "FastAPI", "fastapi": "FastAPI",
+    "py torch": "PyTorch", "pytorch": "PyTorch",
+    "ml": "Machine Learning", "machine learning": "Machine Learning",
+    "dl": "Deep Learning", "deep learning": "Deep Learning",
+    "llms": "LLM", "llm": "LLM",
+    "large language model": "LLM", "large language models": "LLM",
+    "cv": "Computer Vision", "computer vision": "Computer Vision",
+    "nlp": "NLP", "natural language processing": "NLP",
+    "react js": "React", "reactjs": "React", "react": "React",
+    "node js": "Node.js", "nodejs": "Node.js", "node.js": "Node.js",
+    "mongo db": "MongoDB", "mongodb": "MongoDB",
+    "tensor flow": "TensorFlow", "tensorflow": "TensorFlow",
+    "postgre sql": "PostgreSQL", "postgresql": "PostgreSQL",
     "sql server": "SQL Server",
-    "hugging face": "Hugging Face",
-    "huggingface": "Hugging Face",
+    "hugging face": "Hugging Face", "huggingface": "Hugging Face",
     "hugging-face": "Hugging Face",
-    "aws": "AWS",
-    "gcp": "GCP",
-    "google cloud": "GCP",
-    "ci/cd": "CI/CD",
-    "cicd": "CI/CD",
+    "aws": "AWS", "gcp": "GCP", "google cloud": "GCP",
+    "ci/cd": "CI/CD", "cicd": "CI/CD",
 }
+
+
+def _run_generation(prompt, max_new_tokens=800):
+    """
+    Runs a single generation call on whichever device was auto-detected
+    at startup (DEVICE). No Hugging Face Spaces / ZeroGPU machinery --
+    just a plain local model.generate() call.
+    """
+    messages = [{"role": "user", "content": prompt}]
+    chat_text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    inputs = tokenizer(chat_text, return_tensors="pt").to(DEVICE)
+
+    start_time = time.time()
+    with torch.no_grad():
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            temperature=0.1,
+            top_p=0.9,
+            do_sample=True,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+    elapsed = time.time() - start_time
+    print(f"[DEBUG] Generation time ({DEVICE}): {elapsed:.2f}s")
+
+    generated_ids = output_ids[0][inputs["input_ids"].shape[1]:]
+    return tokenizer.decode(generated_ids, skip_special_tokens=True)
 
 
 class MatchService:
-   
-    def ask_llm(self, prompt, _retry=True):
-        """
-        Calls the Hugging Face Router chat-completions endpoint.
-        temperature/top_p are set low to make skill extraction more
-        consistent across repeated calls on the same resume.
-        """
-        payload = {
-            "model": MODEL_NAME,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 800,
-            "temperature": 0.1,
-            "top_p": 0.9,
-        }
-
-        start_time = time.time()
+    
+    # LLM call
+    
+    def ask_llm(self, prompt, max_new_tokens=800):
         try:
-           
-            # minute the first time, so we give it a generous timeout.
-            response = requests.post(API_URL, headers=HEADERS, json=payload, timeout=120)
-        except requests.exceptions.Timeout:
-            if _retry:
-                # One retry: the model is very likely warm now after the
-                # first (timed-out) request triggered its cold start.
-                return self.ask_llm(prompt, _retry=False)
-            raise RuntimeError(
-                "Hugging Face API timed out twice in a row. The model may be "
-                "cold-starting on the provider's side -- wait a minute and try again."
-            )
-        except requests.exceptions.RequestException as e:
-            raise RuntimeError(f"Could not reach Hugging Face API: {e}")
+            return _run_generation(prompt, max_new_tokens=max_new_tokens)
+        except Exception as e:
+            raise RuntimeError(f"Local model generation failed: {e}")
 
-        elapsed = time.time() - start_time
-        print(f"[DEBUG] HF API response time: {elapsed:.2f}s")
-
-        if response.status_code >= 400:
-            
-            try:
-                detail = response.json()
-            except ValueError:
-                detail = response.text
-            raise RuntimeError(
-                f"Hugging Face API error {response.status_code} for model "
-                f"'{MODEL_NAME}': {detail}"
-            )
-
-        try:
-            return response.json()["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, ValueError) as e:
-            raise RuntimeError(f"Unexpected LLM response format: {e}")
-
-  
+    
+    # JSON parsing (never raises -- always returns a usable dict)
+    
     @staticmethod
     def _strip_markdown_fences(raw_text):
-        """Strip ```json ... ``` or plain ``` ... ``` fences if present."""
         text = raw_text.strip()
         if text.startswith("```"):
             parts = text.split("```")
@@ -141,16 +106,8 @@ class MatchService:
     def _safe_json_parse(raw_text):
         """
         Robustly extracts a {"skills": [...], "experience": [...], "education": [...]}
-        object from an LLM response. Handles:
-          - markdown code fences
-          - leading/trailing explanation text
-          - extra text after the JSON ("Extra data" errors)
-          - multiple JSON blocks in one response (picks the first valid one
-            that actually looks like our expected shape)
-          - completely invalid/unparsable output
-
-        Never raises -- falls back to EMPTY_EXTRACTION on any failure, so a
-        single bad LLM response can't crash the whole match_resume pipeline.
+        object from an LLM response. Never raises -- falls back to
+        EMPTY_EXTRACTION on any failure.
         """
         if not raw_text:
             return dict(EMPTY_EXTRACTION)
@@ -173,7 +130,6 @@ class MatchService:
                 obj.setdefault("skills", [])
                 obj.setdefault("experience", [])
                 obj.setdefault("education", [])
-               
                 for key in ("skills", "experience", "education"):
                     if obj[key] is None:
                         obj[key] = []
@@ -269,21 +225,13 @@ Job Description:
         response = self.ask_llm(prompt)
         return self._safe_json_parse(response)
 
-   
+    # ------------------------------------------------------------------
     # Skill normalization
-    
+    # ------------------------------------------------------------------
     @staticmethod
     def normalize_skills(skills):
-        """
-        Cleans and standardizes a list of raw skill strings:
-          - trims whitespace, collapses internal multi-spaces
-          - ignores case for comparison
-          - maps common aliases to a standard name (see SKILL_ALIASES)
-          - removes duplicates while preserving first-seen order
-        """
         if not skills:
             return []
-
         normalized = []
         seen = set()
         for raw in skills:
@@ -299,37 +247,76 @@ Job Description:
                 normalized.append(standard)
         return normalized
 
-    
+    # ------------------------------------------------------------------
     # Scoring
-    
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _skills_are_related(skill_a, skill_b):
+        """
+        Looser match for skills that mean the same thing but are worded
+        differently (e.g. resume says 'Deep Q-Learning', JD says
+        'Reinforcement Learning'). Two skills are considered related if:
+          - one is a substring of the other (e.g. 'SQL' in 'SQL Server'), or
+          - they share a significant word overlap, or
+          - they're textually similar (typo/phrasing tolerance)
+        """
+        a, b = skill_a.lower(), skill_b.lower()
+        if a == b:
+            return True
+        if a in b or b in a:
+            return True
+
+        a_words = set(a.replace("-", " ").replace("/", " ").split())
+        b_words = set(b.replace("-", " ").replace("/", " ").split())
+        # Ignore filler words so "Machine Learning" vs "Learning Models"
+        # doesn't false-match on "Learning" alone.
+        filler = {"and", "or", "with", "the", "of", "for", "a"}
+        a_words -= filler
+        b_words -= filler
+        if a_words and b_words and (a_words & b_words):
+            overlap_ratio = len(a_words & b_words) / min(len(a_words), len(b_words))
+            if overlap_ratio >= 0.5:
+                return True
+
+        return difflib.SequenceMatcher(None, a, b).ratio() >= 0.85
+
     def calculate_score(self, resume_skills, jd_skills):
-        """
-        Normalizes both skill lists, then compares case/space-insensitively.
-        Returns (score, matched_skills, missing_skills, resume_norm, jd_norm).
-        """
         resume_norm = self.normalize_skills(resume_skills)
         jd_norm = self.normalize_skills(jd_skills)
 
         resume_lookup = {s.lower(): s for s in resume_norm}
         jd_lookup = {s.lower(): s for s in jd_norm}
 
-        matched_keys = set(resume_lookup) & set(jd_lookup)
-        missing_keys = set(jd_lookup) - set(resume_lookup)
+        # Pass 1: exact match (after normalization).
+        exact_matched_keys = set(resume_lookup) & set(jd_lookup)
+        remaining_jd_keys = set(jd_lookup) - exact_matched_keys
+        remaining_resume_keys = set(resume_lookup) - exact_matched_keys
 
-        matched = sorted(jd_lookup[k] for k in matched_keys)
-        missing = sorted(jd_lookup[k] for k in missing_keys)
+        matched = {jd_lookup[k] for k in exact_matched_keys}
+
+        # Pass 2: fuzzy/substring match for whatever didn't match exactly,
+        # so near-equivalent skills worded differently still count.
+        still_missing_keys = set()
+        for jd_key in remaining_jd_keys:
+            found = False
+            for resume_key in remaining_resume_keys:
+                if self._skills_are_related(jd_key, resume_key):
+                    matched.add(jd_lookup[jd_key])
+                    found = True
+                    break
+            if not found:
+                still_missing_keys.add(jd_key)
+
+        missing = sorted(jd_lookup[k] for k in still_missing_keys)
+        matched = sorted(matched)
 
         score = (len(matched) / max(len(jd_lookup), 1)) * 100
         return round(score, 2), matched, missing, resume_norm, jd_norm
 
-    
+    # ------------------------------------------------------------------
     # Suggestions
-    
+    # ------------------------------------------------------------------
     def generate_suggestion(self, resume_text, jd_text, missing_skills=None):
-        """
-        Plain-text response on purpose -- this is NOT JSON, do not parse it
-        with _safe_json_parse / json.loads.
-        """
         missing_str = ", ".join(missing_skills) if missing_skills else "none identified"
 
         prompt = f"""Compare this resume and job description as an ATS expert.
@@ -351,9 +338,11 @@ Resume:
 Job Description:
 {jd_text}
 """
-        return self.ask_llm(prompt)
+        return self.ask_llm(prompt, max_new_tokens=500)
 
-    
+    # ------------------------------------------------------------------
+    # Orchestration
+    # ------------------------------------------------------------------
     def match_resume(self, pdf_path, jd):
         resume_text = self.extract_text(pdf_path)
 
@@ -362,8 +351,6 @@ Job Description:
 
         print(f"[DEBUG] Resume JSON: {resume_json}")
         print(f"[DEBUG] JD JSON: {jd_json}")
-        print(f"[DEBUG] Resume skills (raw): {resume_json.get('skills', [])}")
-        print(f"[DEBUG] JD skills (raw): {jd_json.get('skills', [])}")
 
         score, matched, missing, resume_norm, jd_norm = self.calculate_score(
             resume_json.get("skills", []), jd_json.get("skills", [])
