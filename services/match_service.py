@@ -1,13 +1,4 @@
-"""
-match_service.py
 
-Core matching logic for the AI Resume Matcher.
-Handles PDF text extraction, LLM-based skill extraction (resume + JD),
-skill normalization, match scoring, and suggestion generation.
-
-Architecture, FastAPI routes, and Gradio UI are unchanged -- this file
-only improves reliability, consistency, and accuracy of the matching logic.
-"""
 
 import os
 import json
@@ -23,9 +14,7 @@ if not HF_TOKEN:
     )
 
 API_URL = "https://router.huggingface.co/v1/chat/completions"
-# Most default HF providers (Together, Fireworks, Sambanova, ...) only host the
-# bigger Qwen2.5 variants (7B+). Featherless AI is confirmed to host the 3B one,
-# so we pin it explicitly with the ":provider" suffix. Model is unchanged.
+
 MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct:featherless-ai"
 
 HEADERS = {
@@ -37,11 +26,11 @@ HEADERS = {
 MIN_RESUME_TEXT_LENGTH = 30
 
 # Empty skeleton returned whenever extraction/parsing fails, so downstream
-# code (calculate_score, etc.) never has to special-case a missing key.
+.
 EMPTY_EXTRACTION = {"skills": [], "experience": [], "education": []}
 
 # Common aliases -> standard skill name. Lookup is case-insensitive and
-# whitespace-normalized (extra internal spaces collapsed) before matching.
+
 SKILL_ALIASES = {
     "fast api": "FastAPI",
     "fastapi": "FastAPI",
@@ -84,9 +73,7 @@ SKILL_ALIASES = {
 
 
 class MatchService:
-    # ------------------------------------------------------------------
-    # LLM call
-    # ------------------------------------------------------------------
+   
     def ask_llm(self, prompt, _retry=True):
         """
         Calls the Hugging Face Router chat-completions endpoint.
@@ -103,8 +90,7 @@ class MatchService:
 
         start_time = time.time()
         try:
-            # Serverless providers often need to "cold start" a model that
-            # hasn't been requested recently -- this can take well over a
+           
             # minute the first time, so we give it a generous timeout.
             response = requests.post(API_URL, headers=HEADERS, json=payload, timeout=120)
         except requests.exceptions.Timeout:
@@ -123,7 +109,7 @@ class MatchService:
         print(f"[DEBUG] HF API response time: {elapsed:.2f}s")
 
         if response.status_code >= 400:
-            # Surface HF's actual error body instead of a generic "Bad Request".
+            
             try:
                 detail = response.json()
             except ValueError:
@@ -138,9 +124,7 @@ class MatchService:
         except (KeyError, IndexError, ValueError) as e:
             raise RuntimeError(f"Unexpected LLM response format: {e}")
 
-    # ------------------------------------------------------------------
-    # JSON parsing (never raises -- always returns a usable dict)
-    # ------------------------------------------------------------------
+  
     @staticmethod
     def _strip_markdown_fences(raw_text):
         """Strip ```json ... ``` or plain ``` ... ``` fences if present."""
@@ -189,8 +173,7 @@ class MatchService:
                 obj.setdefault("skills", [])
                 obj.setdefault("experience", [])
                 obj.setdefault("education", [])
-                # Guard against null values in case the model returns
-                # "skills": null instead of an empty list.
+               
                 for key in ("skills", "experience", "education"):
                     if obj[key] is None:
                         obj[key] = []
@@ -201,9 +184,9 @@ class MatchService:
         print(f"[WARN] Could not parse expected JSON from LLM response. Preview: {raw_text[:200]!r}")
         return dict(EMPTY_EXTRACTION)
 
-    # ------------------------------------------------------------------
+    
     # PDF text extraction
-    # ------------------------------------------------------------------
+    
     def extract_text(self, pdf_path):
         text = ""
         with pdfplumber.open(pdf_path) as pdf:
@@ -223,9 +206,9 @@ class MatchService:
             )
         return text
 
-    # ------------------------------------------------------------------
+    
     # LLM-based extraction
-    # ------------------------------------------------------------------
+    
     def extract_resume(self, resume_text):
         prompt = f"""You are an ATS (Applicant Tracking System) AI.
 
@@ -286,9 +269,9 @@ Job Description:
         response = self.ask_llm(prompt)
         return self._safe_json_parse(response)
 
-    # ------------------------------------------------------------------
+   
     # Skill normalization
-    # ------------------------------------------------------------------
+    
     @staticmethod
     def normalize_skills(skills):
         """
@@ -316,9 +299,9 @@ Job Description:
                 normalized.append(standard)
         return normalized
 
-    # ------------------------------------------------------------------
+    
     # Scoring
-    # ------------------------------------------------------------------
+    
     def calculate_score(self, resume_skills, jd_skills):
         """
         Normalizes both skill lists, then compares case/space-insensitively.
@@ -339,9 +322,9 @@ Job Description:
         score = (len(matched) / max(len(jd_lookup), 1)) * 100
         return round(score, 2), matched, missing, resume_norm, jd_norm
 
-    # ------------------------------------------------------------------
+    
     # Suggestions
-    # ------------------------------------------------------------------
+    
     def generate_suggestion(self, resume_text, jd_text, missing_skills=None):
         """
         Plain-text response on purpose -- this is NOT JSON, do not parse it
@@ -370,9 +353,7 @@ Job Description:
 """
         return self.ask_llm(prompt)
 
-    # ------------------------------------------------------------------
-    # Orchestration
-    # ------------------------------------------------------------------
+    
     def match_resume(self, pdf_path, jd):
         resume_text = self.extract_text(pdf_path)
 
