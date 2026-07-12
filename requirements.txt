@@ -1,3 +1,7 @@
 gradio
 pdfplumber
 requests
+transformers
+accelerate
+torch
+sentencepiece
